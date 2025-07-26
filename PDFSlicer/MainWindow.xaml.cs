@@ -1,12 +1,14 @@
 ﻿using ClosedXML.Excel;
+using ICSharpCode.SharpZipLib.Zip;
+using PdfSharpCore.Pdf;
 using PdfSharpCore.Pdf.IO;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows;
-using PdfSharpCore.Pdf;
 
 namespace PDFSlicer
 {
@@ -54,29 +56,39 @@ namespace PDFSlicer
         {
             if (string.IsNullOrEmpty(txtExcelPath.Text) || lstPdfFiles.Items.Count == 0)
             {
-                MessageBox.Show("Please select Excel file and PDF files");
+                MessageBox.Show("Пожалуйста, выберите Excel-файл и PDF-файлы");
                 return;
             }
 
             if (!int.TryParse(txtStartRow.Text, out int startRow))
             {
-                MessageBox.Show("Invalid start row number");
+                MessageBox.Show("Неверный номер начальной строки");
                 return;
             }
 
             try
             {
                 var excelData = ExcelParser.Parse(txtExcelPath.Text, startRow);
+
+                var excelRecords = excelData.Values.ToList();
+
+                int currentRecordIndex = 0;
+
                 progressBar.Maximum = lstPdfFiles.Items.Count;
                 progressBar.Value = 0;
 
-                foreach (var pdfPath in lstPdfFiles.Items)
+                foreach (var item in lstPdfFiles.Items)
                 {
-                    ProcessPdf(pdfPath.ToString(), excelData);
+                    string pdfPath = item.ToString();
+
+                    ProcessPdf(pdfPath, excelRecords, ref currentRecordIndex);
+
                     progressBar.Value++;
+                    txtLog.AppendText($"Обработан файл: {Path.GetFileName(pdfPath)}\n");
                 }
 
-                txtLog.AppendText("Processing completed successfully!\n");
+                ResetForm();
+                txtLog.AppendText("DONE\n");
             }
             catch (Exception ex)
             {
@@ -85,30 +97,56 @@ namespace PDFSlicer
             }
         }
 
-        private void ProcessPdf(string pdfPath, Dictionary<string, ExcelRecord> excelData)
+        private void ResetForm()
         {
-            var pdfInfo = PdfProcessor.ParsePdfName(Path.GetFileNameWithoutExtension(pdfPath));
-            var outputDirectory = Path.Combine(Path.GetDirectoryName(pdfPath), "Output");
-            Directory.CreateDirectory(outputDirectory);
+            txtExcelPath.Text = string.Empty;
+            lstPdfFiles.Items.Clear();
+        }
 
-            using (var document = PdfReader.Open(pdfPath, PdfDocumentOpenMode.Import))
+        private void ProcessPdf(string pdfPath, List<ExcelRecord> excelData, ref int currentRecordIndex)
+        {
+            string pdfName = Path.GetFileName(pdfPath);
+            string outputDirectory = Path.Combine(Path.GetDirectoryName(pdfPath), "Output");
+
+            try
             {
-                for (int i = 0; i < document.PageCount; i++)
-                {
-                    var page = document.Pages[i];
-                    var record = PdfProcessor.FindMatchingRecord(pdfInfo, excelData, i + 1);
+                Directory.CreateDirectory(outputDirectory);
 
-                    if (record != null)
+                using (var document = PdfReader.Open(pdfPath, PdfDocumentOpenMode.Import))
+                {
+                    for (int pageIndex = 0; pageIndex < document.PageCount; pageIndex++)
                     {
-                        var newFileName = PdfProcessor.GenerateFileName(Path.GetFileName(pdfPath), record);
-                        PdfProcessor.SaveSinglePage(page, outputDirectory, newFileName);
-                        txtLog.AppendText($"Created: {newFileName}\n");
-                    }
-                    else
-                    {
-                        txtLog.AppendText($"No matching record found for page {i + 1}\n");
+                        if (currentRecordIndex >= excelData.Count)
+                        {
+                            txtLog.AppendText($"ОШИБКА: Недостаточно записей в Excel для страницы {pageIndex + 1}\n");
+                            return;
+                        }
+
+                        var page = document.Pages[pageIndex];
+                        var record = excelData[currentRecordIndex];
+                        currentRecordIndex++;
+
+                        // Формируем имя файла на основе исходного имени PDF и ФИО из Excel
+                        string newFileName = PdfProcessor.GenerateFileName(pdfName, record);
+                        string outputPath = Path.Combine(outputDirectory, newFileName);
+
+                        SaveSinglePage(page, outputPath);
+                        txtLog.AppendText($"Создан файл: {newFileName}\n");
                     }
                 }
+            }
+            catch (Exception ex)
+            {
+                txtLog.AppendText($"ОШИБКА обработки {pdfName}: {ex.Message}\n");
+            }
+        }
+
+        private void SaveSinglePage(PdfPage page, string outputPath)
+        {
+            using (var newDocument = new PdfDocument())
+            {
+                newDocument.AddPage(page);
+                newDocument.Save(outputPath);
             }
         }
     }
@@ -157,7 +195,6 @@ namespace PDFSlicer
                     }
                     catch (Exception ex)
                     {
-                        // Логирование ошибки парсинга строки
                         Console.WriteLine($"Ошибка обработки строки {row}: {ex.Message}");
                     }
                 }
@@ -216,16 +253,25 @@ namespace PDFSlicer
 
         public static ExcelRecord FindMatchingRecord(PdfInfo pdfInfo, Dictionary<string, ExcelRecord> excelData, int pageNumber)
         {
-            // Simple matching logic based on page order
             return excelData.Values.Skip(pageNumber - 1).FirstOrDefault();
         }
 
         public static string GenerateFileName(string originalPdfName, ExcelRecord record)
         {
-            var cleanName = originalPdfName.Replace(".pdf", "");
-            var cleanFullName = RemoveInvalidChars(record.FullName.Replace(" ", "_"));
+            string baseName = Path.GetFileNameWithoutExtension(originalPdfName);
+            string cleanFullName = ProcessFullName(record.FullName);
 
-            return $"{cleanName}-{cleanFullName}.pdf";
+            return $"{baseName}-{cleanFullName}.pdf";
+        }
+
+        private static string ProcessFullName(string fullName)
+        {
+            if (string.IsNullOrWhiteSpace(fullName))
+                return "No_Name";
+
+            string cleaned = Regex.Replace(fullName.Trim(), @"\s+", " ");
+
+            return cleaned.Replace(" ", "_");
         }
 
         public static void SaveSinglePage(PdfPage page, string directory, string fileName)
@@ -256,12 +302,6 @@ namespace PDFSlicer
             }
 
             return shortened.ToString().TrimEnd('_');
-        }
-
-        private static string RemoveInvalidChars(string input)
-        {
-            var invalidChars = System.IO.Path.GetInvalidFileNameChars();
-            return new string(input.Where(c => !invalidChars.Contains(c)).ToArray());
         }
 
         private static string FormatDate(string date)
